@@ -359,16 +359,22 @@ export default function Scene3D({
           alpha: false,
           powerPreference: "high-performance",
           stencil: false,
-          depth: true
+          depth: true,
+          preserveDrawingBuffer: false
         }}
-        dpr={[1, 1.5]}
+        dpr={[1, Math.min(window.devicePixelRatio, 2)]}
         frameloop="always"
-        performance={{ min: 0.5 }}
+        performance={{ min: 0.5, max: 1 }}
+        flat
+        linear
       >
         <PerspectiveCamera makeDefault position={cameraPosition} fov={cameraFov} />
         <OrbitControls 
           enableDamping 
-          dampingFactor={0.08}
+          dampingFactor={0.05}
+          rotateSpeed={0.5}
+          zoomSpeed={0.8}
+          panSpeed={0.5}
           minDistance={isIndoor ? 4 : 5}
           maxDistance={isIndoor ? 20 : 50}
           maxPolarAngle={Math.PI / 2.1}

@@ -143,6 +143,27 @@ export default function DroneControlUI() {
     setMissionLog(prev => [...prev.slice(-5), `${timestamp}: ${message}`]);
   };
 
+  // Get user's location on app startup
+  useEffect(() => {
+    const initializeLocation = async () => {
+      try {
+        addLog('🌍 Initializing GPS system...');
+        const location = await getCurrentLocation();
+        setCurrentLocationData(location);
+        setBaseLocation({ lat: location.lat, lon: location.lon, name: 'Your Location' });
+        setUseCurrentLocation(true);
+        setLocationError(null);
+        addLog(`✅ Base station set at: ${location.lat.toFixed(6)}, ${location.lon.toFixed(6)}`);
+        addLog(`📡 GPS accuracy: ±${location.accuracy.toFixed(0)}m`);
+      } catch (error) {
+        setLocationError(error.message);
+        addLog(`⚠️ Using default location (${baseLocation.name})`);
+        addLog(`💡 Enable location to use your real position`);
+      }
+    };
+    initializeLocation();
+  }, []); // Run once on mount
+
   // Handle parameter changes
   const handleParameterChange = (param, value) => {
     setParameters(prev => ({ ...prev, [param]: value }));
@@ -155,12 +176,25 @@ export default function DroneControlUI() {
     addLog(`🎯 Preset loaded: ${preset.name}`);
   };
 
-  // Update flight path with GPS coordinates
+  // Update flight path with GPS coordinates (throttled for performance)
   useEffect(() => {
     if (flying) {
-      setFlightPath(prev => [...prev, { lat: droneGPS.lat, lon: droneGPS.lon, alt: altitude }]);
+      const interval = setInterval(() => {
+        setFlightPath(prev => {
+          const lastPoint = prev[prev.length - 1];
+          // Only add new point if position changed significantly
+          if (!lastPoint || 
+              Math.abs(lastPoint.lat - droneGPS.lat) > 0.000001 || 
+              Math.abs(lastPoint.lon - droneGPS.lon) > 0.000001) {
+            return [...prev.slice(-100), { lat: droneGPS.lat, lon: droneGPS.lon, alt: altitude }]; // Keep last 100 points
+          }
+          return prev;
+        });
+      }, 500); // Update every 500ms
+      
+      return () => clearInterval(interval);
     }
-  }, [dronePosition, flying]);
+  }, [flying, droneGPS, altitude]);
 
   // Update terrain elevation
   useEffect(() => {
@@ -300,6 +334,10 @@ export default function DroneControlUI() {
       setCurrent(0);
       setPowerConsumption(0);
       setTotalFlightTime(0);
+      // Reset failsafe when landed
+      if (failsafeStatus !== 'OK') {
+        setFailsafeStatus('OK');
+      }
       return;
     }
 
@@ -459,7 +497,32 @@ export default function DroneControlUI() {
       // Battery drain - using adjustable battery capacity and environment multiplier
       const capacityScale = parameters.batteryCapacity / 5000; // Scale relative to default 5000mAh
       const drainRate = (totalCurrent / 36000) / capacityScale * envPhysics.batteryDrainMultiplier; // Apply environment drain
-      setBattery(prev => Math.max(prev - drainRate, 0));
+      setBattery(prev => {
+        const newBattery = Math.max(prev - drainRate, 0);
+        
+        // Battery warnings
+        if (newBattery <= 20 && prev > 20) {
+          addLog('⚠️ LOW BATTERY: 20% remaining!');
+          setFailsafeStatus('LOW_BATTERY');
+        }
+        if (newBattery <= 10 && prev > 10) {
+          addLog('🚨 CRITICAL BATTERY: 10% - Return to base!');
+          setFailsafeStatus('CRITICAL_BATTERY');
+        }
+        if (newBattery <= 5 && prev > 5) {
+          addLog('🚨 EMERGENCY: Auto-landing initiated!');
+          setFailsafeStatus('EMERGENCY_LAND');
+          // Auto-land
+          setThrottle(0);
+          setFlying(false);
+          setArmed(false);
+          if (autoSimulation) {
+            setAutoSimulation(false);
+          }
+        }
+        
+        return newBattery;
+      });
       
       // Signal degradation - using adjustable signal range
       const distanceFromBase = calculateDistance(dronePosition, { x: 10, y: 90 });
@@ -491,11 +554,22 @@ export default function DroneControlUI() {
       setCpuLoad(15 + (flying ? 25 : 0) + (graspMode ? 10 : 0) + Math.random() * 5);
       setLoopTime(250 + Math.random() * 50);
       
-      // Failsafe monitoring
-      if (battery < 20) setFailsafeStatus('LOW_BATTERY');
-      else if (signalStrength < 50) setFailsafeStatus('WEAK_SIGNAL');
-      else if (altitude > 120) setFailsafeStatus('MAX_ALT');
-      else setFailsafeStatus('OK');
+      // Failsafe monitoring (priority order: battery > signal > altitude)
+      if (battery <= 5) {
+        setFailsafeStatus('EMERGENCY_LAND');
+      } else if (battery <= 10) {
+        setFailsafeStatus('CRITICAL_BATTERY');
+      } else if (battery <= 20) {
+        setFailsafeStatus('LOW_BATTERY');
+      } else if (signalStrength < 40) {
+        setFailsafeStatus('SIGNAL_LOST');
+      } else if (signalStrength < 50) {
+        setFailsafeStatus('WEAK_SIGNAL');
+      } else if (altitude > parameters.maxAltitude) {
+        setFailsafeStatus('MAX_ALT');
+      } else {
+        setFailsafeStatus('OK');
+      }
       
     }, 100);
 
@@ -636,29 +710,63 @@ export default function DroneControlUI() {
     sequence();
   }, [autoSimulation, simulationStep]);
 
-  // Movement animation
+  // Movement animation - smooth velocity-based movement
   const moveToPosition = (target) => {
     const startPos = { ...dronePosition };
     const distance = calculateDistance(startPos, target);
-    const duration = (distance / getShapeMultipliers().speed) * 30;
-    const steps = 60;
+    const multipliers = getShapeMultipliers();
+    const maxSpeed = parameters.maxSpeed * multipliers.speed / 25; // Scale speed
+    
+    // Calculate direction
+    const dx = target.x - startPos.x;
+    const dy = target.y - startPos.y;
+    const angle = Math.atan2(dy, dx);
+    
+    // Smooth acceleration and deceleration
+    const accelDistance = distance * 0.3; // 30% of distance for accel/decel
     let currentStep = 0;
-
+    const updateInterval = 50; // 20 FPS for smooth movement
+    const totalSteps = Math.max(30, Math.floor(distance * 2)); // Scale steps with distance
+    
     const moveInterval = setInterval(() => {
       currentStep++;
-      const progress = currentStep / steps;
-      const easeProgress = 1 - Math.pow(1 - progress, 3); // Ease out cubic
+      const progress = currentStep / totalSteps;
       
-      setDronePosition({
-        x: startPos.x + (target.x - startPos.x) * easeProgress,
-        y: startPos.y + (target.y - startPos.y) * easeProgress
-      });
-
-      if (currentStep >= steps) {
-        clearInterval(moveInterval);
-        setDronePosition(target);
+      // Smooth S-curve for acceleration/deceleration
+      let speedFactor;
+      if (progress < 0.3) {
+        // Accelerate (ease in)
+        speedFactor = Math.pow(progress / 0.3, 2);
+      } else if (progress > 0.7) {
+        // Decelerate (ease out)
+        speedFactor = Math.pow((1 - progress) / 0.3, 2);
+      } else {
+        // Cruise at max speed
+        speedFactor = 1;
       }
-    }, duration / steps);
+      
+      // Calculate velocity
+      const speed = maxSpeed * speedFactor;
+      const vx = Math.cos(angle) * speed;
+      const vy = Math.sin(angle) * speed;
+      
+      setVelocity({ x: vx * 0.3, y: vy * 0.3 }); // Scale for visual effect
+      
+      setDronePosition(prev => {
+        const newX = startPos.x + dx * progress;
+        const newY = startPos.y + dy * progress;
+        
+        // Check if reached target
+        const distRemaining = calculateDistance({ x: newX, y: newY }, target);
+        if (distRemaining < 1 || currentStep >= totalSteps) {
+          clearInterval(moveInterval);
+          setVelocity({ x: 0, y: 0 });
+          return target;
+        }
+        
+        return { x: newX, y: newY };
+      });
+    }, updateInterval);
   };
 
   // Manual controls
@@ -874,11 +982,15 @@ export default function DroneControlUI() {
 
                 <button
                   onClick={handleGetCurrentLocation}
-                  title="Get current location"
-                  className="px-3 py-2 rounded-xl text-sm font-semibold flex items-center gap-1 bg-black/40 text-purple-300 border border-purple-500/50 hover:bg-black/60 transition-all"
+                  title={useCurrentLocation ? "Using your location" : "Get current location"}
+                  className={`px-3 py-2 rounded-xl text-sm font-semibold flex items-center gap-1 transition-all ${
+                    useCurrentLocation 
+                      ? 'bg-green-500 text-white hover:bg-green-600' 
+                      : 'bg-black/40 text-purple-300 border border-purple-500/50 hover:bg-black/60'
+                  }`}
                 >
                   <Crosshair size={16} />
-                  <span>GPS</span>
+                  <span>{useCurrentLocation ? '📍 Your Location' : 'Get GPS'}</span>
                 </button>
 
                 {isIndoor && (
@@ -912,18 +1024,22 @@ export default function DroneControlUI() {
               <div className={`flex items-center gap-2 px-3 py-1 rounded-full border ${
                 battery > 50 ? 'bg-blue-500/20 border-blue-500/50' : 
                 battery > 20 ? 'bg-yellow-500/20 border-yellow-500/50' : 
-                'bg-red-500/20 border-red-500/50'
+                'bg-red-500/20 border-red-500/50 animate-pulse'
               }`}>
-                <Battery size={16} className={
+                <Battery size={16} className={`${
                   battery > 50 ? 'text-blue-400' : 
                   battery > 20 ? 'text-yellow-400' : 
                   'text-red-400'
-                } />
+                } ${battery <= 10 ? 'animate-bounce' : ''}`} />
                 <span className={`text-sm font-semibold ${
                   battery > 50 ? 'text-blue-400' : 
                   battery > 20 ? 'text-yellow-400' : 
                   'text-red-400'
-                }`}>{battery.toFixed(0)}%</span>
+                }`}>
+                  {battery.toFixed(0)}%
+                  {battery <= 20 && battery > 10 && ' ⚠️'}
+                  {battery <= 10 && ' 🚨'}
+                </span>
               </div>
               <div className="flex items-center gap-2 bg-purple-500/20 px-3 py-1 rounded-full border border-purple-500/50">
                 <span className="text-purple-400 text-sm font-semibold">{flightMode}</span>
@@ -1052,34 +1168,90 @@ export default function DroneControlUI() {
 
               {/* Drone visualization */}
               <div 
-                className="absolute transition-all duration-300 ease-out"
+                className="absolute transition-all duration-200 ease-out"
                 style={{ 
                   left: `${dronePosition.x}%`, 
                   top: `${dronePosition.y}%`,
-                  transform: 'translate(-50%, -50%)'
+                  transform: `translate(-50%, -50%) ${altitude > 0 ? `scale(${1 + altitude * 0.002})` : 'scale(1)'}`
                 }}
               >
+                {/* Central body */}
                 <div className={`w-16 h-16 border-4 rounded-full flex items-center justify-center transition-all duration-500 ${
                   armed ? 'border-green-400 shadow-lg shadow-green-400/50' : 'border-purple-400'
                 }`}>
                   <Radio size={24} className={flying ? 'text-green-400' : 'text-purple-400'} />
                 </div>
                 
-                {/* Rotor indicators with realistic rotation */}
-                {[0, 90, 180, 270].map((angle, idx) => (
-                  <div
-                    key={angle}
-                    className={`absolute w-6 h-6 rounded-full transition-all duration-300 ${
-                      flying ? 'bg-green-400 shadow-lg shadow-green-400/50' : 'bg-purple-400'
-                    }`}
+                {/* Morphing arms with rotors - showing current shape mode */}
+                {(() => {
+                  // Define arm positions based on shape mode
+                  const armConfigs = {
+                    standard: [
+                      { angle: 45, distance: 30 },   // Front-right
+                      { angle: 135, distance: 30 },  // Back-right
+                      { angle: 225, distance: 30 },  // Back-left
+                      { angle: 315, distance: 30 }   // Front-left
+                    ],
+                    compact: [
+                      { angle: 45, distance: 22 },   // Closer X pattern
+                      { angle: 135, distance: 22 },
+                      { angle: 225, distance: 22 },
+                      { angle: 315, distance: 22 }
+                    ],
+                    'wide-grasp': [
+                      { angle: 0, distance: 35 },    // Wider spread
+                      { angle: 90, distance: 35 },
+                      { angle: 180, distance: 35 },
+                      { angle: 270, distance: 35 }
+                    ]
+                  };
+                  
+                  const currentConfig = armConfigs[shapeMode] || armConfigs.standard;
+                  
+                  return currentConfig.map((config, idx) => (
+                    <div key={idx}>
+                      {/* Morphing arm */}
+                      <div
+                        className={`absolute w-1 transition-all duration-500 ${
+                          graspMode ? 'bg-orange-400' : 'bg-purple-400/60'
+                        }`}
+                        style={{
+                          top: '50%',
+                          left: '50%',
+                          height: `${config.distance - 6}px`,
+                          transformOrigin: 'top center',
+                          transform: `translate(-50%, -50%) rotate(${config.angle}deg) translateY(-${config.distance/2}px)`
+                        }}
+                      />
+                      {/* Rotor with realistic rotation */}
+                      <div
+                        className={`absolute w-6 h-6 rounded-full transition-all duration-500 ${
+                          flying ? 'bg-green-400 shadow-lg shadow-green-400/50' : 'bg-purple-400'
+                        }`}
+                        style={{
+                          top: '50%',
+                          left: '50%',
+                          transform: `translate(-50%, -50%) rotate(${config.angle}deg) translateY(-${config.distance}px) rotate(${flying ? rotorRotation + idx * 90 : 0}deg)`,
+                          transition: flying ? 'transform 0.05s linear' : 'all 0.5s'
+                        }}
+                      />
+                    </div>
+                  ));
+                })()}
+
+                {/* Altitude shadow indicator */}
+                {altitude > 0 && (
+                  <div 
+                    className="absolute w-16 h-16 bg-black rounded-full blur-xl transition-all duration-200"
                     style={{
                       top: '50%',
                       left: '50%',
-                      transform: `translate(-50%, -50%) rotate(${angle}deg) translateY(-30px) rotate(${flying ? rotorRotation + idx * 90 : 0}deg)`,
-                      transition: flying ? 'transform 0.05s linear' : 'all 0.3s'
+                      transform: `translate(-50%, -50%)`,
+                      opacity: Math.min(0.3, altitude / 100),
+                      scale: 1 + altitude * 0.01
                     }}
                   />
-                ))}
+                )}
 
                 {/* Package attached indicator */}
                 {packageGrabbed && (
@@ -1090,23 +1262,41 @@ export default function DroneControlUI() {
               </div>
 
               {/* Status overlay */}
-              <div className="absolute top-4 left-4 right-4 flex justify-between">
+              <div className="absolute top-4 left-4 right-4 flex justify-between items-center">
                 <div className="bg-black/60 px-3 py-1 rounded-full text-green-400 text-sm font-semibold">
                   {flying ? '● FLYING' : '○ STANDBY'}
                 </div>
-                <div className="bg-black/60 px-3 py-1 rounded-full text-purple-400 text-sm font-semibold">
-                  {shapeMode.toUpperCase()}
+                <div className="flex gap-2">
+                  <div className={`bg-black/60 px-3 py-1 rounded-full text-sm font-semibold ${
+                    shapeMode === 'standard' ? 'text-blue-400' : 
+                    shapeMode === 'compact' ? 'text-purple-400' : 'text-yellow-400'
+                  }`}>
+                    {shapeMode.toUpperCase()}
+                  </div>
+                  {graspMode && (
+                    <div className="bg-black/60 px-3 py-1 rounded-full text-orange-400 text-sm font-semibold animate-pulse">
+                      🤏 GRASPING
+                    </div>
+                  )}
                 </div>
               </div>
 
-              {/* Legend */}
-              <div className="absolute bottom-4 left-4 bg-black/60 p-2 rounded-lg text-xs">
+              {/* Legend & Info */}
+              <div className="absolute bottom-4 left-4 bg-black/60 p-3 rounded-lg text-xs space-y-2">
                 <div className="flex items-center gap-2 text-blue-300">
-                  <Package size={12} /> Pickup
+                  <Package size={12} /> Pickup Point
                 </div>
                 <div className="flex items-center gap-2 text-green-300">
-                  <div className="w-3 h-3 bg-green-400 rounded-full" /> Target
+                  <div className="w-3 h-3 bg-green-400 rounded-full" /> Delivery Target
                 </div>
+                <div className="border-t border-white/20 pt-2 text-purple-300">
+                  Alt: {altitude.toFixed(1)}m
+                </div>
+                {packageGrabbed && (
+                  <div className="text-yellow-400 font-semibold">
+                    📦 Package Secured
+                  </div>
+                )}
               </div>
               </>
                 )
@@ -1311,10 +1501,25 @@ export default function DroneControlUI() {
 
                 {/* Power */}
                 <div className="bg-white/5 p-2 rounded">
-                  <div className="text-purple-300 mb-1">Power System</div>
+                  <div className="text-purple-300 mb-1">Power & Battery</div>
                   <div className="text-white">Voltage: {voltage.toFixed(2)}V</div>
                   <div className="text-white">Current: {current.toFixed(2)}A</div>
                   <div className="text-yellow-400">{powerConsumption.toFixed(0)}W</div>
+                  <div className={`text-sm mt-1 ${battery > 20 ? 'text-green-400' : 'text-red-400'}`}>
+                    Battery: {battery.toFixed(1)}%
+                    {flying && (
+                      <span className="text-xs ml-1">
+                        ({(battery / (current / 5)).toFixed(0)}min)
+                      </span>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-4 gap-1 mt-1">
+                    {batteryCell.map((cell, i) => (
+                      <div key={i} className={`text-xs ${cell > 3.7 ? 'text-green-300' : cell > 3.5 ? 'text-yellow-300' : 'text-red-300'}`}>
+                        {cell.toFixed(2)}V
+                      </div>
+                    ))}
+                  </div>
                 </div>
 
                 {/* Motors */}
@@ -1342,6 +1547,13 @@ export default function DroneControlUI() {
                   <div className="text-white">CPU: {cpuLoad.toFixed(0)}%</div>
                   <div className="text-white">Loop: {loopTime.toFixed(0)}μs</div>
                   <div className="text-white">Mode: {flightMode}</div>
+                  <div className={`text-sm mt-1 font-semibold ${
+                    failsafeStatus === 'OK' ? 'text-green-400' : 
+                    failsafeStatus.includes('LOW') ? 'text-yellow-400' : 
+                    'text-red-400 animate-pulse'
+                  }`}>
+                    {failsafeStatus === 'OK' ? '✓ All Systems OK' : `⚠️ ${failsafeStatus.replace(/_/g, ' ')}`}
+                  </div>
                 </div>
 
                 {/* Battery Cells */}
