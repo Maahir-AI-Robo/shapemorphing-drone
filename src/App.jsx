@@ -3,6 +3,7 @@ import { Battery, Wifi, Navigation, Package, Zap, Settings, Play, Square, Camera
 import MapView from './components/MapView';
 import ParametersPanel from './components/ParametersPanel';
 import Scene3D from './components/Scene3D';
+import Drone3DMiniView from './components/Drone3DMiniView';
 import { pixelToGPS, gpsToPixel, calculateGPSDistance, moveGPSCoordinate, getTerrainElevation, PRESET_LOCATIONS } from './utils/gpsUtils';
 import { getCurrentLocation, checkIndoorBounds, constrainToIndoorBounds, getEnvironmentPhysics, INDOOR_BOUNDS, PIDController } from './utils/environmentUtils';
 
@@ -176,6 +177,13 @@ export default function DroneControlUI() {
       setBaseLocation({ lat: location.lat, lon: location.lon, name: 'Current Location' });
       setUseCurrentLocation(true);
       setLocationError(null);
+      
+      // Reset drone to base position when switching location
+      setDronePosition({ x: 10, y: 90 });
+      setAltitude(0);
+      setFlying(false);
+      setArmed(false);
+      
       addLog(`✅ Location: ${location.lat.toFixed(6)}, ${location.lon.toFixed(6)} (±${location.accuracy.toFixed(0)}m)`);
     } catch (error) {
       setLocationError(error.message);
@@ -195,6 +203,17 @@ export default function DroneControlUI() {
       setAltitude(0);
       addLog(`⚠️ Landed due to environment change`);
     }
+
+    // Reset PID controllers
+    pitchPID.current.reset();
+    rollPID.current.reset();
+    yawPID.current.reset();
+
+    // Reset drone position to base
+    setDronePosition({ x: 10, y: 90 });
+    setPitch(0);
+    setRoll(0);
+    setYaw(0);
 
     // Apply environment-specific physics
     const envPhysics = getEnvironmentPhysics(newMode, indoorBounds);
@@ -221,6 +240,23 @@ export default function DroneControlUI() {
     const preset = INDOOR_BOUNDS[key];
     if (preset) {
       setIndoorBounds(preset);
+      
+      // Reset drone if flying
+      if (flying) {
+        setFlying(false);
+        setArmed(false);
+        setAltitude(0);
+        addLog(`⚠️ Landed due to bounds change`);
+      }
+      
+      // Reset PID controllers
+      pitchPID.current.reset();
+      rollPID.current.reset();
+      yawPID.current.reset();
+      
+      // Reset drone position
+      setDronePosition({ x: 10, y: 90 });
+      
       // Recalculate environment physics
       const envPhysics = getEnvironmentPhysics(isIndoor, preset);
       setParameters(prev => ({
@@ -297,14 +333,22 @@ export default function DroneControlUI() {
         return Math.min(temp + (targetTemp - temp) * 0.05, 85); // Max 85°C
       }));
       
-      // Throttle calculation based on altitude target
-      const targetAlt = 50;
-      const altError = targetAlt - altitude;
-      const newThrottle = Math.max(0, Math.min(100, 50 + altError * 2));
-      setThrottle(newThrottle);
+      // Throttle - only auto-manage in simulation mode, otherwise manual hover
+      if (autoSimulation) {
+        const targetAlt = 50;
+        const altError = targetAlt - altitude;
+        const newThrottle = Math.max(0, Math.min(100, 50 + altError * 2));
+        setThrottle(newThrottle);
+      } else {
+        // Manual mode: maintain hover throttle around 50% or user-controlled
+        setThrottle(prev => {
+          const hoverThrottle = 50 + (altitude > 0 ? 5 : 0); // Slight boost when airborne
+          return prev === 0 ? hoverThrottle : prev;
+        });
+      }
       
       // Altitude physics with vertical speed - using environment max altitude
-      const climbRate = (newThrottle - 50) / 10; // m/s
+      const climbRate = (throttle - 50) / 10; // m/s
       setVerticalSpeed(climbRate);
       setAltitude(prev => {
         const newAlt = Math.max(0, Math.min(prev + climbRate * 0.1, envPhysics.maxAltitude));
@@ -323,15 +367,17 @@ export default function DroneControlUI() {
       const targetPitch = -velocity.y * 5 / stabilityFactor;
       const targetRoll = velocity.x * 5 / stabilityFactor;
       
-      // Apply PID control for stabilization
-      const dt = 0.1; // 100ms update interval
-      const pitchCorrection = pitchPID.current.calculate(targetPitch, pitch, dt);
-      const rollCorrection = rollPID.current.calculate(targetRoll, roll, dt);
+      // Apply smooth transition instead of PID (which was causing runaway)
+      setPitch(prev => {
+        const diff = targetPitch - prev;
+        return prev + diff * 0.3; // Smooth damping
+      });
+      setRoll(prev => {
+        const diff = targetRoll - prev;
+        return prev + diff * 0.3; // Smooth damping
+      });
       
-      setPitch(targetPitch + pitchCorrection * 0.1);
-      setRoll(targetRoll + rollCorrection * 0.1);
-      
-      // Yaw and Heading updates with PID control
+      // Yaw and Heading updates with smooth damping
       if (velocity.x !== 0 || velocity.y !== 0) {
         const targetHeading = (Math.atan2(velocity.x, -velocity.y) * 180 / Math.PI + 360) % 360;
         setHeading(prev => {
@@ -339,23 +385,28 @@ export default function DroneControlUI() {
           return (prev + diff * 0.1 + 360) % 360;
         });
         
-        // Apply yaw PID control
-        const yawCorrection = yawPID.current.calculate(heading, yaw, dt);
-        setYaw(heading + yawCorrection * 0.1);
+        // Smooth yaw transition
+        setYaw(prev => {
+          const diff = (heading - prev + 540) % 360 - 180;
+          return (prev + diff * 0.2 + 360) % 360;
+        });
       }
       
       // Indoor bounds enforcement
       if (isIndoor) {
+        // Convert map position (0-100) to 3D meters (centered at 0,0)
         const dronePos3D = {
-          x: (dronePosition.x - 50) * 0.1,
-          y: altitude,
-          z: (dronePosition.y - 50) * 0.1
+          x: (dronePosition.x - 50) * 0.1,  // X position in meters
+          y: altitude,                        // Y (altitude) in meters
+          z: (dronePosition.y - 50) * 0.1   // Z position in meters
         };
         
         const boundsCheck = checkIndoorBounds(dronePos3D, indoorBounds);
         if (!boundsCheck.withinBounds) {
-          // Constrain position
+          // Constrain position - returns 3D position in meters
           const constrained = constrainToIndoorBounds(dronePos3D, indoorBounds);
+          
+          // Convert back to map coordinates (0-100)
           setDronePosition({
             x: 50 + constrained.x / 0.1,
             y: 50 + constrained.z / 0.1
@@ -363,7 +414,8 @@ export default function DroneControlUI() {
           setAltitude(constrained.y);
           
           // Log collision
-          if (boundsCheck.violations.x) addLog('⚠️ Wall collision detected');
+          if (boundsCheck.violations.x) addLog('⚠️ Wall collision detected (X)');
+          if (boundsCheck.violations.z) addLog('⚠️ Wall collision detected (Z)');
           if (boundsCheck.violations.y) addLog('⚠️ Ceiling/floor collision detected');
         }
       }
@@ -381,7 +433,7 @@ export default function DroneControlUI() {
       const motorPowerScale = parameters.motorPower / 200; // Scale relative to default 200W
       const baseCurrent = armed ? 2.5 * motorPowerScale : 0.1; // Amperes
       const flightCurrent = flying ? baseCurrent + (throttle / 100) * 25 * motorPowerScale : baseCurrent;
-      const windCurrent = (parameters.windStrength / 10) * 2;
+      const windCurrent = (envPhysics.windStrength / 10) * 2; // Use environment wind
       const shapeCurrent = (1 / multipliers.efficiency) * 3;
       const payloadCurrent = parameters.payloadWeight * 0.5; // Current increases with payload
       const totalCurrent = flightCurrent + windCurrent + shapeCurrent + payloadCurrent + (graspMode ? 1.5 : 0);
@@ -404,9 +456,9 @@ export default function DroneControlUI() {
       // Power consumption in Watts
       setPowerConsumption(voltageDropUnderLoad > 0 ? batteryVoltage * totalCurrent : 0);
       
-      // Battery drain - using adjustable battery capacity
+      // Battery drain - using adjustable battery capacity and environment multiplier
       const capacityScale = parameters.batteryCapacity / 5000; // Scale relative to default 5000mAh
-      const drainRate = (totalCurrent / 36000) / capacityScale; // Convert to % per 0.1 second
+      const drainRate = (totalCurrent / 36000) / capacityScale * envPhysics.batteryDrainMultiplier; // Apply environment drain
       setBattery(prev => Math.max(prev - drainRate, 0));
       
       // Signal degradation - using adjustable signal range
@@ -416,10 +468,10 @@ export default function DroneControlUI() {
       const altitudeLoss = Math.min(altitude * 0.05, 10);
       setSignalStrength(Math.max(100 - signalLoss - altitudeLoss, 40));
       
-      // Environmental simulation - using adjustable wind strength
-      setWindSpeed(prev => Math.max(0, Math.min(parameters.windStrength + (Math.random() - 0.5) * 2, parameters.windStrength * 1.5)));
+      // Environmental simulation - using environment wind strength
+      setWindSpeed(prev => Math.max(0, Math.min(envPhysics.windStrength + (Math.random() - 0.5) * 2, envPhysics.windStrength * 1.5)));
       setWindDirection(prev => (prev + (Math.random() - 0.5) * 5 + 360) % 360);
-      setTemperature(22 - altitude * 0.15 + terrainElevation * 0.01); // Temperature affected by terrain
+      setTemperature(isIndoor ? 22 : 22 - altitude * 0.15 + terrainElevation * 0.01); // Indoor constant temp
       setPressure(1013.25 * Math.pow(1 - (altitude + terrainElevation) / 44330, 5.255)); // Barometric formula with terrain
       
       // IMU sensors
@@ -448,16 +500,17 @@ export default function DroneControlUI() {
     }, 100);
 
     return () => clearInterval(physicsLoop);
-  }, [flying, velocity, dronePosition, altitude, shapeMode, armed, throttle, motorRPM, windSpeed, heading, yaw, verticalSpeed, graspMode, battery, signalStrength]);
+  }, [flying, shapeMode, isIndoor]);
 
-  // Auto simulation sequence with realistic movement
+  // Auto simulation sequence with realistic movement and morphing
   useEffect(() => {
     if (!autoSimulation) return;
 
     const sequence = async () => {
       switch(simulationStep) {
         case 0:
-          addLog('🚁 Initializing systems...');
+          addLog('🚁 Initializing flight systems...');
+          setShapeMode('standard');
           setTimeout(() => setSimulationStep(1), 1500);
           break;
         case 1:
@@ -466,76 +519,112 @@ export default function DroneControlUI() {
           setTimeout(() => setSimulationStep(2), 1500);
           break;
         case 2:
-          addLog('🚀 Taking off...');
+          addLog('🚀 Taking off to cruise altitude...');
           setFlying(true);
+          setThrottle(65); // Climb
           setTimeout(() => setSimulationStep(3), 2500);
           break;
         case 3:
           addLog('🎯 Flying to package location...');
+          setThrottle(55); // Cruise
           moveToPosition(packagePosition);
-          setTimeout(() => setSimulationStep(4), 3000);
+          setTimeout(() => setSimulationStep(4), 4000);
           break;
         case 4:
-          addLog('📍 Package location reached');
+          addLog('📍 Hovering above package...');
+          setThrottle(50); // Hover
           setTimeout(() => setSimulationStep(5), 1500);
           break;
         case 5:
-          addLog('🔄 Morphing to Wide-Grasp mode...');
-          handleShapeChange('wide-grasp');
-          setTimeout(() => setSimulationStep(6), 2500);
+          addLog('🔄 Morphing to compact grasp configuration...');
+          handleShapeChange('compact');
+          setTimeout(() => setSimulationStep(6), 2000);
           break;
         case 6:
-          addLog('📦 Grasping package...');
-          setGraspMode(true);
-          setPackageGrabbed(true);
-          setDeliveryStatus('grasped');
+          addLog('⬇️ Descending to package level...');
+          setThrottle(40); // Descend
           setTimeout(() => setSimulationStep(7), 2000);
           break;
         case 7:
-          addLog('🔄 Morphing to Compact mode for speed...');
-          handleShapeChange('compact');
+          addLog('📦 Engaging grasp mode and securing package...');
+          setGraspMode(true);
+          setPackageGrabbed(true);
+          setDeliveryStatus('grasped');
+          setThrottle(50); // Stop descent
           setTimeout(() => setSimulationStep(8), 2500);
           break;
         case 8:
-          addLog('✈️ Flying to delivery location...');
-          moveToPosition(targetPosition);
-          setTimeout(() => setSimulationStep(9), 4000);
+          addLog('⬆️ Ascending with package...');
+          setThrottle(60); // Climb with payload
+          setTimeout(() => setSimulationStep(9), 2000);
           break;
         case 9:
-          addLog('📍 Delivery location reached');
-          setTimeout(() => setSimulationStep(10), 1500);
+          addLog('🔄 Morphing to standard flight configuration...');
+          handleShapeChange('standard');
+          setTimeout(() => setSimulationStep(10), 2000);
           break;
         case 10:
-          addLog('🔄 Morphing to Precision mode...');
-          handleShapeChange('precision');
-          setTimeout(() => setSimulationStep(11), 2500);
+          addLog('✈️ Flying to delivery location...');
+          setThrottle(55); // Cruise
+          moveToPosition(targetPosition);
+          setTimeout(() => setSimulationStep(11), 4500);
           break;
         case 11:
-          addLog('📤 Releasing package...');
+          addLog('📍 Hovering above delivery point...');
+          setThrottle(50); // Hover
+          setTimeout(() => setSimulationStep(12), 1500);
+          break;
+        case 12:
+          addLog('🔄 Morphing to placement configuration...');
+          handleShapeChange('compact');
+          setTimeout(() => setSimulationStep(13), 2000);
+          break;
+        case 13:
+          addLog('⬇️ Descending to delivery altitude...');
+          setThrottle(40); // Descend
+          setTimeout(() => setSimulationStep(14), 2000);
+          break;
+        case 14:
+          addLog('📤 Releasing package at delivery point...');
           setGraspMode(false);
           setPackageGrabbed(false);
           setDeliveryStatus('delivered');
-          setTimeout(() => setSimulationStep(12), 2000);
-          break;
-        case 12:
-          addLog('🏠 Returning to base...');
-          moveToPosition({ x: 10, y: 90 });
-          setTimeout(() => setSimulationStep(13), 3500);
-          break;
-        case 13:
-          addLog('🔄 Morphing to Standard mode...');
-          handleShapeChange('standard');
-          setTimeout(() => setSimulationStep(14), 2500);
-          break;
-        case 14:
-          addLog('🛬 Landing...');
-          setFlying(false);
+          setThrottle(50); // Stop descent
           setTimeout(() => setSimulationStep(15), 2000);
           break;
         case 15:
-          addLog('✅ Mission completed successfully!');
+          addLog('⬆️ Ascending from delivery point...');
+          setThrottle(60); // Climb
+          setTimeout(() => setSimulationStep(16), 2000);
+          break;
+        case 16:
+          addLog('🔄 Morphing back to standard configuration...');
+          handleShapeChange('standard');
+          setTimeout(() => setSimulationStep(17), 2000);
+          break;
+        case 17:
+          addLog('🏠 Returning to home base...');
+          setThrottle(55); // Cruise
+          moveToPosition({ x: 10, y: 90 });
+          setTimeout(() => setSimulationStep(18), 4000);
+          break;
+        case 18:
+          addLog('� Base location reached, preparing to land...');
+          setThrottle(50); // Hover
+          setTimeout(() => setSimulationStep(19), 1500);
+          break;
+        case 19:
+          addLog('🛬 Landing...');
+          setThrottle(35); // Descend to land
+          setTimeout(() => setSimulationStep(20), 2500);
+          break;
+        case 20:
+          addLog('✅ Touchdown! Mission completed successfully!');
+          setFlying(false);
+          setThrottle(0);
           setArmed(false);
           setDeliveryStatus('ready');
+          addLog(`📊 Total flight time: ${totalFlightTime.toFixed(1)}s | Max altitude: ${maxAltitudeReached.toFixed(1)}m`);
           setTimeout(() => {
             setAutoSimulation(false);
             setSimulationStep(0);
@@ -764,40 +853,45 @@ export default function DroneControlUI() {
                 ))}
               </select>
               {/* Environment / View controls */}
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
                 <button
                   onClick={handleEnvironmentToggle}
                   title={isIndoor ? 'Switch to Outdoor' : 'Switch to Indoor'}
-                  className={`px-3 py-2 rounded-xl text-sm font-semibold transition-all ${isIndoor ? 'bg-yellow-600 text-black' : 'bg-indigo-600 text-white'}`}
+                  className={`px-3 py-2 rounded-xl text-sm font-semibold flex items-center gap-1 transition-all ${isIndoor ? 'bg-yellow-500 text-black hover:bg-yellow-600' : 'bg-indigo-500 text-white hover:bg-indigo-600'}`}
                 >
-                  {isIndoor ? <Building2 size={16} /> : <Globe size={16} />} {isIndoor ? 'Indoor' : 'Outdoor'}
+                  {isIndoor ? <Building2 size={16} /> : <Globe size={16} />}
+                  <span>{isIndoor ? 'Indoor' : 'Outdoor'}</span>
                 </button>
 
                 <button
                   onClick={handleView3DToggle}
                   title={view3D ? 'Switch to 2D view' : 'Switch to 3D view'}
-                  className={`px-3 py-2 rounded-xl text-sm font-semibold transition-all ${view3D ? 'bg-purple-500 text-white' : 'bg-black/40 text-purple-300 border border-purple-500/50'}`}
+                  className={`px-3 py-2 rounded-xl text-sm font-semibold flex items-center gap-1 transition-all ${view3D ? 'bg-purple-500 text-white hover:bg-purple-600' : 'bg-black/40 text-purple-300 border border-purple-500/50 hover:bg-black/60'}`}
                 >
-                  {view3D ? '3D View' : '2D View'}
+                  <Camera size={16} />
+                  <span>{view3D ? '3D' : '2D'}</span>
                 </button>
 
                 <button
                   onClick={handleGetCurrentLocation}
                   title="Get current location"
-                  className="px-3 py-2 rounded-xl text-sm font-semibold bg-black/40 text-purple-300 border border-purple-500/50 hover:bg-black/60 transition-all"
+                  className="px-3 py-2 rounded-xl text-sm font-semibold flex items-center gap-1 bg-black/40 text-purple-300 border border-purple-500/50 hover:bg-black/60 transition-all"
                 >
-                  <Crosshair size={16} /> Current
+                  <Crosshair size={16} />
+                  <span>GPS</span>
                 </button>
 
-                <select
-                  value={Object.keys(INDOOR_BOUNDS).find(k => INDOOR_BOUNDS[k] === indoorBounds) || 'medium'}
-                  onChange={(e) => handleIndoorBoundsChange(e.target.value)}
-                  className="px-3 py-2 rounded-xl bg-black/40 text-purple-300 border border-purple-500/50 text-sm font-semibold cursor-pointer hover:bg-black/60 transition-all"
-                >
-                  {Object.keys(INDOOR_BOUNDS).map(key => (
-                    <option key={key} value={key}>{key}</option>
-                  ))}
-                </select>
+                {isIndoor && (
+                  <select
+                    value={Object.keys(INDOOR_BOUNDS).find(k => INDOOR_BOUNDS[k] === indoorBounds) || 'medium'}
+                    onChange={(e) => handleIndoorBoundsChange(e.target.value)}
+                    className="px-3 py-2 rounded-xl bg-black/40 text-purple-300 border border-purple-500/50 text-sm font-semibold cursor-pointer hover:bg-black/60 transition-all capitalize"
+                  >
+                    {Object.keys(INDOOR_BOUNDS).map(key => (
+                      <option key={key} value={key} className="capitalize">{key} Room</option>
+                    ))}
+                  </select>
+                )}
               </div>
               <div className={`flex items-center gap-2 px-3 py-1 rounded-full border ${
                 signalStrength > 80 ? 'bg-green-500/20 border-green-500/50' : 
@@ -838,14 +932,28 @@ export default function DroneControlUI() {
           </div>
         </div>
 
-        {/* New Layout: Simulation on top, controls below */}
-        <div className="grid grid-cols-1 gap-4">
-          {/* Main Simulation View - Full Width */}
-          <div className="bg-black/40 backdrop-blur-xl border border-purple-500/30 rounded-2xl p-6 shadow-2xl">
+        {/* New Layout: Simulation with 3D Mini View */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-4">
+          {/* Primary View - 2/3 width */}
+          <div className="lg:col-span-2 bg-black/40 backdrop-blur-xl border border-purple-500/30 rounded-2xl p-6 shadow-2xl">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-xl font-bold text-white flex items-center gap-2">
-                {showMap ? <Globe className="text-blue-400" /> : <Camera className="text-blue-400" />}
-                {showMap ? 'Satellite Map View' : 'Grid Simulation View'}
+                {showMap ? (
+                  <>
+                    <Globe className="text-blue-400" />
+                    Satellite Map View
+                  </>
+                ) : view3D ? (
+                  <>
+                    <Camera className="text-purple-400" />
+                    3D Simulation View
+                  </>
+                ) : (
+                  <>
+                    <Camera className="text-blue-400" />
+                    Grid Simulation View
+                  </>
+                )}
               </h2>
               {showMap && (
                 <div className="flex gap-2">
@@ -891,6 +999,7 @@ export default function DroneControlUI() {
                       graspMode={graspMode}
                       isIndoor={isIndoor}
                       indoorBounds={indoorBounds}
+                      packageGrabbed={packageGrabbed}
                     />
                   </div>
                 ) : ( <>
@@ -1000,6 +1109,7 @@ export default function DroneControlUI() {
                 </div>
               </div>
               </>
+                )
               )}
             </div>
 
@@ -1036,6 +1146,42 @@ export default function DroneControlUI() {
                 <div className="text-xs text-purple-300">Max Alt</div>
                 <div className="text-xl font-bold text-white">{maxAltitudeReached.toFixed(1)}m</div>
                 <div className="text-xs text-purple-400">record</div>
+              </div>
+            </div>
+          </div>
+
+          {/* 3D Mini View - 1/3 width */}
+          <div className="lg:col-span-1">
+            <div className="bg-black/40 backdrop-blur-xl border border-purple-500/30 rounded-2xl p-4 shadow-2xl h-full">
+              <h3 className="text-lg font-bold text-white mb-3 flex items-center gap-2">
+                <Camera className="text-purple-400" size={20} />
+                3D Drone View
+              </h3>
+              <div className="aspect-square">
+                <Drone3DMiniView
+                  dronePosition={dronePosition}
+                  droneRotation={[pitch * Math.PI / 180, roll * Math.PI / 180, yaw * Math.PI / 180]}
+                  flying={flying}
+                  armed={armed}
+                  throttle={throttle}
+                  shapeMode={shapeMode}
+                  graspMode={graspMode}
+                  altitude={altitude}
+                />
+              </div>
+              <div className="mt-3 space-y-2">
+                <div className="flex justify-between text-sm">
+                  <span className="text-purple-300">Pitch:</span>
+                  <span className="text-white font-semibold">{pitch.toFixed(1)}°</span>
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span className="text-purple-300">Roll:</span>
+                  <span className="text-white font-semibold">{roll.toFixed(1)}°</span>
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span className="text-purple-300">Yaw:</span>
+                  <span className="text-white font-semibold">{yaw.toFixed(1)}°</span>
+                </div>
               </div>
             </div>
           </div>

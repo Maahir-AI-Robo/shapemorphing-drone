@@ -67,36 +67,36 @@ export function stopWatchingLocation(watchId) {
   }
 }
 
-// Indoor bounds configuration
+// Indoor bounds configuration (in meters - actual physical dimensions)
 export const INDOOR_BOUNDS = {
   small: {
-    width: 50,  // meters (5m room)
-    depth: 50,
-    height: 30,  // 3m ceiling
+    width: 5,  // meters - 5m room
+    depth: 5,
+    height: 3,  // 3m ceiling
     maxSpeed: 3,  // m/s
     maxAltitude: 2.5,  // m
     name: 'Small Room (5x5x3m)'
   },
   medium: {
-    width: 100,  // 10m room
-    depth: 100,
-    height: 40,  // 4m ceiling
+    width: 10,  // 10m room (default)
+    depth: 10,
+    height: 4,  // 4m ceiling
     maxSpeed: 5,
     maxAltitude: 3.5,
     name: 'Medium Room (10x10x4m)'
   },
   large: {
-    width: 200,  // 20m warehouse
-    depth: 200,
-    height: 80,  // 8m ceiling
+    width: 20,  // 20m warehouse
+    depth: 20,
+    height: 8,  // 8m ceiling
     maxSpeed: 10,
     maxAltitude: 7,
     name: 'Large Warehouse (20x20x8m)'
   },
   gym: {
-    width: 300,  // 30m gymnasium
-    depth: 200,  // 20m depth
-    height: 100,  // 10m ceiling
+    width: 30,  // 30m gymnasium
+    depth: 20,  // 20m depth
+    height: 10,  // 10m ceiling
     maxSpeed: 12,
     maxAltitude: 9,
     name: 'Gymnasium (30x20x10m)'
@@ -104,61 +104,61 @@ export const INDOOR_BOUNDS = {
 };
 
 // Check if drone is within indoor bounds
+// position: {x, y, z} where x,y are 3D coordinates in meters, z is altitude
 export function checkIndoorBounds(position, bounds, margin = 0.5) {
   const halfWidth = bounds.width / 2;
   const halfDepth = bounds.depth / 2;
 
-  const withinX = Math.abs(position.x - 50) * 0.1 < (halfWidth - margin);
-  const withinY = Math.abs(position.y - 50) * 0.1 < (halfDepth - margin);
-  const withinZ = position.altitude < (bounds.height / 10 - margin);
+  // position.x and position.z are already in meters (converted from map coordinates)
+  const withinX = Math.abs(position.x) < (halfWidth - margin);
+  const withinZ = Math.abs(position.z) < (halfDepth - margin);
+  const withinY = position.y >= 0.1 && position.y < (bounds.height - margin);
 
   return {
-    withinBounds: withinX && withinY && withinZ,
+    withinBounds: withinX && withinZ && withinY,
     violations: {
       x: !withinX,
       y: !withinY,
       z: !withinZ
     },
     distances: {
-      toWallX: (halfWidth - Math.abs(position.x - 50) * 0.1),
-      toWallY: (halfDepth - Math.abs(position.y - 50) * 0.1),
-      toCeiling: (bounds.height / 10 - position.altitude)
+      toWallX: (halfWidth - Math.abs(position.x)),
+      toWallZ: (halfDepth - Math.abs(position.z)),
+      toCeiling: (bounds.height - position.y),
+      toFloor: position.y
     }
   };
 }
 
 // Constrain position within indoor bounds
+// Returns constrained 3D position {x, y, z} in meters
 export function constrainToIndoorBounds(position, bounds, margin = 0.5) {
   const halfWidth = bounds.width / 2;
   const halfDepth = bounds.depth / 2;
 
-  // Convert to actual coordinates
-  const actualX = (position.x - 50) * 0.1;
-  const actualY = (position.y - 50) * 0.1;
-
-  // Constrain X
+  // Constrain X (width)
   const constrainedX = Math.max(
     -(halfWidth - margin),
-    Math.min(halfWidth - margin, actualX)
+    Math.min(halfWidth - margin, position.x)
   );
 
-  // Constrain Y
-  const constrainedY = Math.max(
+  // Constrain Z (depth)
+  const constrainedZ = Math.max(
     -(halfDepth - margin),
-    Math.min(halfDepth - margin, actualY)
+    Math.min(halfDepth - margin, position.z)
   );
 
-  // Constrain altitude
-  const constrainedAlt = Math.max(
+  // Constrain Y (altitude/height)
+  const constrainedY = Math.max(
     0.2,
-    Math.min(bounds.height / 10 - margin, position.altitude)
+    Math.min(bounds.height - margin, position.y)
   );
 
-  // Convert back to percentage
+  // Return constrained 3D position in meters
   return {
-    x: constrainedX / 0.1 + 50,
-    y: constrainedY / 0.1 + 50,
-    altitude: constrainedAlt
+    x: constrainedX,
+    y: constrainedY,
+    z: constrainedZ
   };
 }
 
