@@ -1,5 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Battery, Wifi, Navigation, Package, Zap, Settings, Play, Square, Camera, Radio, PlayCircle, PauseCircle } from 'lucide-react';
+import { Battery, Wifi, Navigation, Package, Zap, Settings, Play, Square, Camera, Radio, PlayCircle, PauseCircle, Map as MapIcon, Globe, Home, Building2, Crosshair } from 'lucide-react';
+import MapView from './components/MapView';
+import ParametersPanel from './components/ParametersPanel';
+import Scene3D from './components/Scene3D';
+import { pixelToGPS, gpsToPixel, calculateGPSDistance, moveGPSCoordinate, getTerrainElevation, PRESET_LOCATIONS } from './utils/gpsUtils';
+import { getCurrentLocation, checkIndoorBounds, constrainToIndoorBounds, getEnvironmentPhysics, INDOOR_BOUNDS, PIDController } from './utils/environmentUtils';
 
 export default function DroneControlUI() {
   const [armed, setArmed] = useState(false);
@@ -69,10 +74,164 @@ export default function DroneControlUI() {
   const animationFrameRef = useRef(null);
   const [maxSpeed, setMaxSpeed] = useState(25);
 
+  // NEW: Real GPS Coordinates and Map Settings
+  const [baseLocation, setBaseLocation] = useState(PRESET_LOCATIONS.sanFrancisco);
+  const [showMap, setShowMap] = useState(true);
+  const [mapType, setMapType] = useState('satellite'); // satellite, street, terrain
+  const [flightPath, setFlightPath] = useState([]);
+  const [terrainElevation, setTerrainElevation] = useState(0);
+  
+  // NEW: Adjustable Flight Parameters
+  const [parameters, setParameters] = useState({
+    maxSpeed: 25, // m/s
+    batteryCapacity: 5000, // mAh
+    motorPower: 200, // Watts
+    windStrength: 5, // m/s
+    gpsAccuracy: 1.5, // meters
+    signalRange: 500, // meters
+    payloadWeight: 2, // kg
+    maxAltitude: 120 // meters
+  });
+
+  // NEW: Drone Presets
+  const dronePresets = [
+    { 
+      name: 'Racing', 
+      icon: '🏎️',
+      params: { maxSpeed: 50, batteryCapacity: 3000, motorPower: 400, windStrength: 5, gpsAccuracy: 2, signalRange: 300, payloadWeight: 0, maxAltitude: 100 }
+    },
+    { 
+      name: 'Photography', 
+      icon: '📸',
+      params: { maxSpeed: 15, batteryCapacity: 8000, motorPower: 150, windStrength: 3, gpsAccuracy: 1, signalRange: 800, payloadWeight: 3, maxAltitude: 150 }
+    },
+    { 
+      name: 'Delivery', 
+      icon: '📦',
+      params: { maxSpeed: 25, batteryCapacity: 5000, motorPower: 200, windStrength: 5, gpsAccuracy: 1.5, signalRange: 500, payloadWeight: 5, maxAltitude: 120 }
+    },
+    { 
+      name: 'Inspection', 
+      icon: '🔍',
+      params: { maxSpeed: 10, batteryCapacity: 10000, motorPower: 100, windStrength: 2, gpsAccuracy: 0.5, signalRange: 1000, payloadWeight: 2, maxAltitude: 200 }
+    }
+  ];
+
+  // NEW: Indoor/Outdoor and 3D View States
+  const [isIndoor, setIsIndoor] = useState(false);
+  const [indoorBounds, setIndoorBounds] = useState(INDOOR_BOUNDS.medium);
+  const [view3D, setView3D] = useState(false);
+  const [useCurrentLocation, setUseCurrentLocation] = useState(false);
+  const [currentLocationData, setCurrentLocationData] = useState(null);
+  const [locationError, setLocationError] = useState(null);
+
+  // PID Controllers for stabilization
+  const pitchPID = useRef(new PIDController(2.0, 0.1, 0.8));
+  const rollPID = useRef(new PIDController(2.0, 0.1, 0.8));
+  const yawPID = useRef(new PIDController(1.5, 0.05, 0.5));
+
+  // Convert pixel positions to GPS coordinates
+  const droneGPS = pixelToGPS(dronePosition.x, dronePosition.y, useCurrentLocation && currentLocationData ? currentLocationData : baseLocation);
+  const baseGPS = useCurrentLocation && currentLocationData ? currentLocationData : baseLocation;
+  const packageGPS = pixelToGPS(packagePosition.x, packagePosition.y, baseGPS);
+  const targetGPS = pixelToGPS(targetPosition.x, targetPosition.y, baseGPS);
+
   // Add log entry
   const addLog = (message) => {
     const timestamp = new Date().toLocaleTimeString();
     setMissionLog(prev => [...prev.slice(-5), `${timestamp}: ${message}`]);
+  };
+
+  // Handle parameter changes
+  const handleParameterChange = (param, value) => {
+    setParameters(prev => ({ ...prev, [param]: value }));
+    addLog(`⚙️ Parameter updated: ${param} = ${value}`);
+  };
+
+  // Handle preset selection
+  const handlePresetSelect = (preset) => {
+    setParameters(preset.params);
+    addLog(`🎯 Preset loaded: ${preset.name}`);
+  };
+
+  // Update flight path with GPS coordinates
+  useEffect(() => {
+    if (flying) {
+      setFlightPath(prev => [...prev, { lat: droneGPS.lat, lon: droneGPS.lon, alt: altitude }]);
+    }
+  }, [dronePosition, flying]);
+
+  // Update terrain elevation
+  useEffect(() => {
+    const elevation = getTerrainElevation(droneGPS);
+    setTerrainElevation(elevation);
+  }, [droneGPS]);
+
+  // Get current user location
+  const handleGetCurrentLocation = async () => {
+    try {
+      addLog('📍 Getting current location...');
+      const location = await getCurrentLocation();
+      setCurrentLocationData(location);
+      setBaseLocation({ lat: location.lat, lon: location.lon, name: 'Current Location' });
+      setUseCurrentLocation(true);
+      setLocationError(null);
+      addLog(`✅ Location: ${location.lat.toFixed(6)}, ${location.lon.toFixed(6)} (±${location.accuracy.toFixed(0)}m)`);
+    } catch (error) {
+      setLocationError(error.message);
+      addLog(`❌ Location error: ${error.message}`);
+    }
+  };
+
+  // Toggle indoor/outdoor mode
+  const handleEnvironmentToggle = () => {
+    const newMode = !isIndoor;
+    setIsIndoor(newMode);
+    
+    // Reset drone if flying
+    if (flying) {
+      setFlying(false);
+      setArmed(false);
+      setAltitude(0);
+      addLog(`⚠️ Landed due to environment change`);
+    }
+
+    // Apply environment-specific physics
+    const envPhysics = getEnvironmentPhysics(newMode, indoorBounds);
+    setParameters(prev => ({
+      ...prev,
+      maxSpeed: envPhysics.maxSpeed,
+      maxAltitude: envPhysics.maxAltitude,
+      windStrength: envPhysics.windStrength,
+      gpsAccuracy: envPhysics.gpsAccuracy,
+      signalRange: envPhysics.signalStrength * 10
+    }));
+
+    addLog(`🏠 Switched to ${newMode ? 'INDOOR' : 'OUTDOOR'} mode`);
+  };
+
+  // Toggle between 2D and 3D view
+  const handleView3DToggle = () => {
+    setView3D(prev => !prev);
+    addLog(`🖼️ Switched to ${!view3D ? '3D' : '2D'} view`);
+  };
+
+  // Change indoor bounds preset
+  const handleIndoorBoundsChange = (key) => {
+    const preset = INDOOR_BOUNDS[key];
+    if (preset) {
+      setIndoorBounds(preset);
+      // Recalculate environment physics
+      const envPhysics = getEnvironmentPhysics(isIndoor, preset);
+      setParameters(prev => ({
+        ...prev,
+        maxSpeed: envPhysics.maxSpeed,
+        maxAltitude: envPhysics.maxAltitude,
+        windStrength: envPhysics.windStrength,
+        gpsAccuracy: envPhysics.gpsAccuracy
+      }));
+      addLog(`📐 Indoor bounds set to ${key}`);
+    }
   };
 
   // Shape mode effects on drone performance
@@ -111,6 +270,9 @@ export default function DroneControlUI() {
     const physicsLoop = setInterval(() => {
       const multipliers = getShapeMultipliers();
       
+      // Get environment-specific physics parameters
+      const envPhysics = getEnvironmentPhysics(isIndoor, indoorBounds);
+      
       // Flight time tracking
       setTotalFlightTime(prev => prev + 0.1);
       
@@ -121,7 +283,7 @@ export default function DroneControlUI() {
       // Motor RPM calculation (realistic quadcopter range: 0-15000 RPM)
       const baseRPM = armed ? 3000 : 0;
       const flightRPM = flying ? baseRPM + (throttle / 100) * 12000 : baseRPM;
-      const windEffect = windSpeed * 50;
+      const windEffect = envPhysics.windStrength * 50; // Use environment wind
       setMotorRPM([
         Math.round(flightRPM + Math.random() * 200 + windEffect),
         Math.round(flightRPM + Math.random() * 200 - windEffect * 0.5),
@@ -141,51 +303,88 @@ export default function DroneControlUI() {
       const newThrottle = Math.max(0, Math.min(100, 50 + altError * 2));
       setThrottle(newThrottle);
       
-      // Altitude physics with vertical speed
+      // Altitude physics with vertical speed - using environment max altitude
       const climbRate = (newThrottle - 50) / 10; // m/s
       setVerticalSpeed(climbRate);
       setAltitude(prev => {
-        const newAlt = Math.max(0, Math.min(prev + climbRate * 0.1, 150));
+        const newAlt = Math.max(0, Math.min(prev + climbRate * 0.1, envPhysics.maxAltitude));
         setMaxAltitudeReached(max => Math.max(max, newAlt));
         return newAlt;
       });
       
-      // Calculate speeds
-      const currentSpeed = Math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y) * 10 * multipliers.speed;
+      // Calculate speeds using environment maxSpeed
+      const speedScale = envPhysics.maxSpeed / 25; // Scale relative to default 25 m/s
+      const currentSpeed = Math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y) * 10 * multipliers.speed * speedScale;
       setSpeed(currentSpeed);
       setGroundSpeed(currentSpeed);
       
-      // Pitch and Roll based on movement direction
-      setPitch(-velocity.y * 5); // Forward/backward tilt
-      setRoll(velocity.x * 5); // Left/right tilt
+      // Pitch and Roll based on movement direction (affected by payload weight)
+      const stabilityFactor = 1 + (parameters.payloadWeight / 10); // More weight = slower response
+      const targetPitch = -velocity.y * 5 / stabilityFactor;
+      const targetRoll = velocity.x * 5 / stabilityFactor;
       
-      // Yaw and Heading updates
+      // Apply PID control for stabilization
+      const dt = 0.1; // 100ms update interval
+      const pitchCorrection = pitchPID.current.calculate(targetPitch, pitch, dt);
+      const rollCorrection = rollPID.current.calculate(targetRoll, roll, dt);
+      
+      setPitch(targetPitch + pitchCorrection * 0.1);
+      setRoll(targetRoll + rollCorrection * 0.1);
+      
+      // Yaw and Heading updates with PID control
       if (velocity.x !== 0 || velocity.y !== 0) {
         const targetHeading = (Math.atan2(velocity.x, -velocity.y) * 180 / Math.PI + 360) % 360;
         setHeading(prev => {
           const diff = (targetHeading - prev + 540) % 360 - 180;
           return (prev + diff * 0.1 + 360) % 360;
         });
-        setYaw(heading);
+        
+        // Apply yaw PID control
+        const yawCorrection = yawPID.current.calculate(heading, yaw, dt);
+        setYaw(heading + yawCorrection * 0.1);
+      }
+      
+      // Indoor bounds enforcement
+      if (isIndoor) {
+        const dronePos3D = {
+          x: (dronePosition.x - 50) * 0.1,
+          y: altitude,
+          z: (dronePosition.y - 50) * 0.1
+        };
+        
+        const boundsCheck = checkIndoorBounds(dronePos3D, indoorBounds);
+        if (!boundsCheck.withinBounds) {
+          // Constrain position
+          const constrained = constrainToIndoorBounds(dronePos3D, indoorBounds);
+          setDronePosition({
+            x: 50 + constrained.x / 0.1,
+            y: 50 + constrained.z / 0.1
+          });
+          setAltitude(constrained.y);
+          
+          // Log collision
+          if (boundsCheck.violations.x) addLog('⚠️ Wall collision detected');
+          if (boundsCheck.violations.y) addLog('⚠️ Ceiling/floor collision detected');
+        }
       }
       
       // GPS simulation (convert position to lat/lon delta)
       const basePos = { x: 10, y: 90 };
       const deltaX = (dronePosition.x - basePos.x) * 0.0001; // ~11m per 0.0001 degree
       const deltaY = -(dronePosition.y - basePos.y) * 0.0001;
-      setGpsCoordinates({
-        lat: 37.7749 + deltaY,
-        lon: -122.4194 + deltaX
-      });
-      setGpsAccuracy(1.2 + Math.random() * 0.6); // 1.2-1.8m typical accuracy
-      setGpsSatellites(Math.max(8, Math.min(16, 12 + Math.floor(Math.random() * 5) - 2)));
+      // Use actual GPS coordinates with configurable base location and environment accuracy
+      setGpsCoordinates(droneGPS);
+      setGpsAccuracy(envPhysics.gpsAccuracy * (0.8 + Math.random() * 0.4)); // ±20% variation
+      setGpsSatellites(Math.max(isIndoor ? 4 : 8, Math.min(16, 12 + Math.floor(Math.random() * 5) - 2)));
       
-      // Power consumption (realistic for 1-2kg drone)
-      const baseCurrent = armed ? 2.5 : 0.1; // Amperes
-      const flightCurrent = flying ? baseCurrent + (throttle / 100) * 25 : baseCurrent;
-      const windCurrent = (windSpeed / 10) * 2;
+      // Power consumption - using adjustable motor power parameter
+      const motorPowerScale = parameters.motorPower / 200; // Scale relative to default 200W
+      const baseCurrent = armed ? 2.5 * motorPowerScale : 0.1; // Amperes
+      const flightCurrent = flying ? baseCurrent + (throttle / 100) * 25 * motorPowerScale : baseCurrent;
+      const windCurrent = (parameters.windStrength / 10) * 2;
       const shapeCurrent = (1 / multipliers.efficiency) * 3;
-      const totalCurrent = flightCurrent + windCurrent + shapeCurrent + (graspMode ? 1.5 : 0);
+      const payloadCurrent = parameters.payloadWeight * 0.5; // Current increases with payload
+      const totalCurrent = flightCurrent + windCurrent + shapeCurrent + payloadCurrent + (graspMode ? 1.5 : 0);
       setCurrent(totalCurrent);
       
       // Voltage drop under load (4S LiPo: 16.8V full, 14.0V empty)
@@ -205,21 +404,23 @@ export default function DroneControlUI() {
       // Power consumption in Watts
       setPowerConsumption(voltageDropUnderLoad > 0 ? batteryVoltage * totalCurrent : 0);
       
-      // Battery drain (Amp-hours)
-      const drainRate = totalCurrent / 36000; // Convert to % per 0.1 second
+      // Battery drain - using adjustable battery capacity
+      const capacityScale = parameters.batteryCapacity / 5000; // Scale relative to default 5000mAh
+      const drainRate = (totalCurrent / 36000) / capacityScale; // Convert to % per 0.1 second
       setBattery(prev => Math.max(prev - drainRate, 0));
       
-      // Signal degradation with distance and obstacles
+      // Signal degradation - using adjustable signal range
       const distanceFromBase = calculateDistance(dronePosition, { x: 10, y: 90 });
-      const signalLoss = Math.min(distanceFromBase * 0.12, 25);
+      const maxRange = parameters.signalRange;
+      const signalLoss = Math.min((distanceFromBase / maxRange) * 60, 50);
       const altitudeLoss = Math.min(altitude * 0.05, 10);
       setSignalStrength(Math.max(100 - signalLoss - altitudeLoss, 40));
       
-      // Environmental simulation
-      setWindSpeed(prev => Math.max(0, prev + (Math.random() - 0.5) * 0.2));
+      // Environmental simulation - using adjustable wind strength
+      setWindSpeed(prev => Math.max(0, Math.min(parameters.windStrength + (Math.random() - 0.5) * 2, parameters.windStrength * 1.5)));
       setWindDirection(prev => (prev + (Math.random() - 0.5) * 5 + 360) % 360);
-      setTemperature(22 - altitude * 0.15); // Temperature drops with altitude
-      setPressure(1013.25 * Math.pow(1 - altitude / 44330, 5.255)); // Barometric formula
+      setTemperature(22 - altitude * 0.15 + terrainElevation * 0.01); // Temperature affected by terrain
+      setPressure(1013.25 * Math.pow(1 - (altitude + terrainElevation) / 44330, 5.255)); // Barometric formula with terrain
       
       // IMU sensors
       setAcceleration({
@@ -540,6 +741,64 @@ export default function DroneControlUI() {
               >
                 📥 Export Data
               </button>
+              <button
+                onClick={() => setShowMap(!showMap)}
+                className="px-4 py-2 rounded-xl font-semibold flex items-center gap-2 transition-all duration-300 bg-purple-500/20 text-purple-400 border border-purple-500/50 hover:bg-purple-500/30"
+              >
+                {showMap ? <Camera size={16} /> : <MapIcon size={16} />}
+                {showMap ? 'Grid View' : 'Map View'}
+              </button>
+              <select
+                value={Object.keys(PRESET_LOCATIONS).find(key => PRESET_LOCATIONS[key].lat === baseLocation.lat) || 'custom'}
+                onChange={(e) => {
+                  const location = PRESET_LOCATIONS[e.target.value];
+                  if (location) {
+                    setBaseLocation(location);
+                    addLog(`📍 Location changed to ${location.name}`);
+                  }
+                }}
+                className="px-3 py-2 rounded-xl bg-black/40 text-purple-300 border border-purple-500/50 text-sm font-semibold cursor-pointer hover:bg-black/60 transition-all"
+              >
+                {Object.entries(PRESET_LOCATIONS).map(([key, loc]) => (
+                  <option key={key} value={key}>{loc.name}</option>
+                ))}
+              </select>
+              {/* Environment / View controls */}
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleEnvironmentToggle}
+                  title={isIndoor ? 'Switch to Outdoor' : 'Switch to Indoor'}
+                  className={`px-3 py-2 rounded-xl text-sm font-semibold transition-all ${isIndoor ? 'bg-yellow-600 text-black' : 'bg-indigo-600 text-white'}`}
+                >
+                  {isIndoor ? <Building2 size={16} /> : <Globe size={16} />} {isIndoor ? 'Indoor' : 'Outdoor'}
+                </button>
+
+                <button
+                  onClick={handleView3DToggle}
+                  title={view3D ? 'Switch to 2D view' : 'Switch to 3D view'}
+                  className={`px-3 py-2 rounded-xl text-sm font-semibold transition-all ${view3D ? 'bg-purple-500 text-white' : 'bg-black/40 text-purple-300 border border-purple-500/50'}`}
+                >
+                  {view3D ? '3D View' : '2D View'}
+                </button>
+
+                <button
+                  onClick={handleGetCurrentLocation}
+                  title="Get current location"
+                  className="px-3 py-2 rounded-xl text-sm font-semibold bg-black/40 text-purple-300 border border-purple-500/50 hover:bg-black/60 transition-all"
+                >
+                  <Crosshair size={16} /> Current
+                </button>
+
+                <select
+                  value={Object.keys(INDOOR_BOUNDS).find(k => INDOOR_BOUNDS[k] === indoorBounds) || 'medium'}
+                  onChange={(e) => handleIndoorBoundsChange(e.target.value)}
+                  className="px-3 py-2 rounded-xl bg-black/40 text-purple-300 border border-purple-500/50 text-sm font-semibold cursor-pointer hover:bg-black/60 transition-all"
+                >
+                  {Object.keys(INDOOR_BOUNDS).map(key => (
+                    <option key={key} value={key}>{key}</option>
+                  ))}
+                </select>
+              </div>
               <div className={`flex items-center gap-2 px-3 py-1 rounded-full border ${
                 signalStrength > 80 ? 'bg-green-500/20 border-green-500/50' : 
                 signalStrength > 50 ? 'bg-yellow-500/20 border-yellow-500/50' : 
@@ -583,12 +842,58 @@ export default function DroneControlUI() {
         <div className="grid grid-cols-1 gap-4">
           {/* Main Simulation View - Full Width */}
           <div className="bg-black/40 backdrop-blur-xl border border-purple-500/30 rounded-2xl p-6 shadow-2xl">
-            <h2 className="text-xl font-bold text-white mb-4 flex items-center gap-2">
-              <Camera className="text-blue-400" />
-              Simulation View
-            </h2>
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-xl font-bold text-white flex items-center gap-2">
+                {showMap ? <Globe className="text-blue-400" /> : <Camera className="text-blue-400" />}
+                {showMap ? 'Satellite Map View' : 'Grid Simulation View'}
+              </h2>
+              {showMap && (
+                <div className="flex gap-2">
+                  {['satellite', 'street', 'terrain'].map((type) => (
+                    <button
+                      key={type}
+                      onClick={() => setMapType(type)}
+                      className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
+                        mapType === type
+                          ? 'bg-purple-500 text-white'
+                          : 'bg-white/10 text-purple-300 hover:bg-white/20'
+                      }`}
+                    >
+                      {type.charAt(0).toUpperCase() + type.slice(1)}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
             
             <div className="aspect-video bg-gradient-to-br from-slate-800 to-slate-900 rounded-xl flex items-center justify-center relative overflow-hidden border-2 border-purple-500/30">
+              {showMap ? (
+                <MapView
+                  dronePosition={droneGPS}
+                  basePosition={baseGPS}
+                  packagePosition={packageGPS}
+                  targetPosition={targetGPS}
+                  flightPath={flightPath}
+                  flying={flying}
+                  altitude={altitude}
+                  mapType={mapType}
+                />
+              ) : (
+                view3D ? (
+                  <div className="w-full h-full">
+                    <Scene3D
+                      dronePosition={{ x: dronePosition.x, y: dronePosition.y, altitude }}
+                      droneRotation={[pitch * Math.PI / 180, roll * Math.PI / 180, yaw * Math.PI / 180]}
+                      flying={flying}
+                      armed={armed}
+                      throttle={throttle}
+                      shapeMode={shapeMode}
+                      graspMode={graspMode}
+                      isIndoor={isIndoor}
+                      indoorBounds={indoorBounds}
+                    />
+                  </div>
+                ) : ( <>
               {/* Grid overlay */}
               <div className="absolute inset-0 opacity-20">
                 {[...Array(10)].map((_, i) => (
@@ -694,6 +999,8 @@ export default function DroneControlUI() {
                   <div className="w-3 h-3 bg-green-400 rounded-full" /> Target
                 </div>
               </div>
+              </>
+              )}
             </div>
 
             {/* Primary Telemetry - Horizontal Below Simulation */}
@@ -734,9 +1041,19 @@ export default function DroneControlUI() {
           </div>
         </div>
 
-          {/* Control Panels Below - 3 Column Grid */}
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-            {/* Left Column - Shape & Grasp */}
+          {/* Control Panels Below - 4 Column Grid */}
+          <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
+            {/* Parameters Panel Column */}
+            <div className="lg:col-span-1">
+              <ParametersPanel
+                parameters={parameters}
+                onParameterChange={handleParameterChange}
+                presets={dronePresets}
+                onPresetSelect={handlePresetSelect}
+              />
+            </div>
+
+            {/* Shape & Grasp Column */}
             <div className="space-y-4">
               <div className="bg-black/40 backdrop-blur-xl border border-purple-500/30 rounded-2xl p-6 shadow-2xl">
                 <h2 className="text-xl font-bold text-white mb-4 flex items-center gap-2">
